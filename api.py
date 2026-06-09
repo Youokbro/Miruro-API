@@ -994,7 +994,7 @@ async def get_sources(
         return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
 async def _resolve_stream(url: str, provider: str) -> str:
-    """Follow redirects server-side to get the final playable URL with proper Referer."""
+    """Follow redirects with HEAD only to avoid burning one-time auth tokens."""
     referers = {
         "moo": "https://www.animegg.org/",
         "pewe": "https://anidb.app/",
@@ -1007,9 +1007,6 @@ async def _resolve_stream(url: str, provider: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             resp = await client.head(url, headers=headers)
-            if resp.status_code < 400:
-                return str(resp.url)
-            resp = await client.get(url, headers=headers)
             if resp.status_code < 400:
                 return str(resp.url)
     except Exception:
@@ -1047,10 +1044,23 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
         result["streams"] = streams
 
     return result
+
 @app.get("/proxy/playlist")
 async def proxy_playlist(url: str = Query(...)):
     """Proxy an HLS m3u8 playlist, rewriting segment URLs to go through our proxy."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    import urllib.parse
+    domain = urllib.parse.urlparse(url).hostname or ""
+    ref_map = {
+        "anidb.app": "https://anidb.app/",
+        "vidcache.net": "https://www.animegg.org/",
+        "tools.fast4speed.rsvp": "https://www.animegg.org/",
+    }
+    ref = "https://anidb.app/"
+    for d, r in ref_map.items():
+        if d in domain:
+            ref = r
+            break
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": ref}
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         resp = await client.get(url, headers=headers)
         if resp.status_code != 200:
@@ -1062,9 +1072,9 @@ async def proxy_playlist(url: str = Query(...)):
     for line in content.split("\n"):
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and not stripped.startswith("http"):
-            lines.append(f"/proxy/segment?url={base_url}{stripped}&referer={url}")
+            lines.append(f"/proxy/segment?url={base_url}{stripped}&referer={ref}")
         elif stripped and stripped.startswith("http"):
-            lines.append(f"/proxy/segment?url={stripped}&referer={url}")
+            lines.append(f"/proxy/segment?url={stripped}&referer={ref}")
         else:
             lines.append(line)
 
