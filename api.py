@@ -1,6 +1,6 @@
 import base64, json, gzip, httpx, os
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
@@ -993,14 +993,36 @@ async def get_sources(
             raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
         return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
+async def _resolve_stream(url: str, provider: str) -> str:
+    """Follow redirects server-side to get the final playable URL with proper Referer."""
+    referers = {
+        "moo": "https://www.animegg.org/",
+        "pewe": "https://anidb.app/",
+        "bee": "https://animebee.cc/",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer": referers.get(provider, "https://www.miruro.tv/"),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.head(url, headers=headers)
+            if resp.status_code < 400:
+                return str(resp.url)
+            resp = await client.get(url, headers=headers)
+            if resp.status_code < 400:
+                return str(resp.url)
+    except Exception:
+        pass
+    return url
+
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
-    """The super simple sources endpoint resolving slugs (prefix-number) back to provider IDs."""
+    """Resolve stream URL through redirect chain to get a playable, CORS-friendly URL."""
     data = await _fetch_raw_episodes(anilist_id)
     prov_data = data.get("providers", {}).get(provider, {})
     ep_list = prov_data.get("episodes", {}).get(category, [])
-    
-    # Resolve the slug back to the original ID
+
     target_id = None
     for ep in ep_list:
         orig_id = ep.get("id", "")
@@ -1009,8 +1031,58 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
         if generated == slug:
             target_id = orig_id
             break
-            
+
     if not target_id:
-        raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
-        
-    return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
+        raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found")
+
+    result = await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
+    streams = result.get("streams", [])
+    if not streams:
+        return result
+
+    raw_url = streams[0]["url"]
+    resolved_url = await _resolve_stream(raw_url, provider)
+    if resolved_url:
+        streams[0]["url"] = resolved_url
+        result["streams"] = streams
+
+    return result
+@app.get("/proxy/playlist")
+async def proxy_playlist(url: str = Query(...)):
+    """Proxy an HLS m3u8 playlist, rewriting segment URLs to go through our proxy."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Failed to fetch playlist")
+        content = resp.text
+
+    base_url = url.rsplit("/", 1)[0] + "/"
+    lines = []
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("http"):
+            lines.append(f"/proxy/segment?url={base_url}{stripped}&referer={url}")
+        elif stripped and stripped.startswith("http"):
+            lines.append(f"/proxy/segment?url={stripped}&referer={url}")
+        else:
+            lines.append(line)
+
+    return Response(content="\n".join(lines), media_type="application/vnd.apple.mpegurl",
+                    headers={"Access-Control-Allow-Origin": "https://youokbro.github.io",
+                             "Access-Control-Allow-Credentials": "true"})
+
+
+@app.get("/proxy/segment")
+async def proxy_segment(url: str = Query(...), referer: str = Query(None)):
+    """Proxy an HLS segment (.ts file)."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    if referer:
+        headers["Referer"] = referer
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Segment fetch failed")
+        return Response(content=resp.content, media_type=resp.headers.get("content-type", "video/MP2T"),
+                        headers={"Access-Control-Allow-Origin": "https://youokbro.github.io",
+                                 "Access-Control-Allow-Credentials": "true"})
