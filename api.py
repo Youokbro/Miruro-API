@@ -1,6 +1,7 @@
-import base64, json, gzip, httpx, os
+import base64, json, gzip, httpx, os, re
+from urllib.parse import quote, urljoin, urlparse
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
@@ -1015,3 +1016,213 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
         raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
 
     return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
+
+
+# ─── AniZone Scraper ──────────────────────────────────────────────────────────
+
+ANIZONE_BASE = "https://anizone.to"
+ANIZONE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://anizone.to/",
+}
+
+
+def _anizone_page_title(html: str):
+    """Extract the anime title from a watch page <title> tag."""
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, re.DOTALL | re.IGNORECASE)
+    if m:
+        full = m.group(1).strip()
+        for q in ['&quot;', '"', '&#39;', "'"]:
+            if q in full:
+                parts = full.split(q)
+                if len(parts) >= 3:
+                    return parts[1].strip()
+        if '\u2014' in full:
+            return full.split('\u2014')[0].strip()
+        if '—' in full:
+            return full.split('—')[0].strip()
+    return None
+
+
+async def _anizone_scan_page(client, page: int, target_lower: str, alt_lower: str = ""):
+    """Fetch a single browse page and check if it contains the target title.
+    Returns slug if found, None otherwise."""
+    url = f"{ANIZONE_BASE}/anime?page={page}" if page > 1 else f"{ANIZONE_BASE}/anime"
+    r = await client.get(url)
+    if r.status_code != 200:
+        return None
+    idx = 0
+    while True:
+        pos = r.text.find("anmTitles: JSON.parse('", idx)
+        if pos == -1:
+            break
+        start = pos + len("anmTitles: JSON.parse('")
+        end = r.text.find("')", start)
+        if end == -1:
+            break
+        raw = r.text[start:end]
+        key_pos = r.text.find('wire:key="a-', end)
+        if key_pos != -1:
+            kstart = key_pos + len('wire:key="a-')
+            kend = r.text.find('"', kstart)
+            if kend != -1:
+                slug = r.text[kstart:kend]
+                try:
+                    parsed = raw.encode().decode('unicode_escape')
+                    titles = json.loads(parsed)
+                    for t in titles.values():
+                        low = t.lower()
+                        if target_lower in low or (alt_lower and alt_lower in low):
+                            return slug
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+        idx = end + 2
+    return None
+
+
+async def _find_anizone_slug(client, title, title_alt=""):
+    """Find anime slug on AniZone by scanning pages concurrently."""
+    target_lower = title.lower()
+    alt_lower = title_alt.lower() if title_alt else ""
+
+    import asyncio
+    page = 1
+    while page <= 80:
+        batch = range(page, min(page + 12, 81))
+        tasks = [_anizone_scan_page(client, p, target_lower, alt_lower) for p in batch]
+        results = await asyncio.gather(*tasks)
+        for slug in results:
+            if slug:
+                return slug
+        page += 12
+    return None
+
+
+@app.get("/anizone/{anilist_id}/{episode_num}")
+async def get_anizone_sources(anilist_id: int, episode_num: int):
+    """Get HLS stream URL from AniZone for a given anime and episode."""
+    gql = "query ($id: Int) { Media(id: $id, type: ANIME) { title { romaji english } } }"
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+
+    title_eng = (media.get("title") or {}).get("english", "")
+    title_rom = (media.get("title") or {}).get("romaji", "")
+    title = title_eng or title_rom
+    if not title:
+        raise HTTPException(status_code=404, detail="No title found for this anime")
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=ANIZONE_HEADERS) as client:
+        slug = await _find_anizone_slug(client, title_eng or title_rom, title_rom if title_eng else "")
+        if not slug:
+            raise HTTPException(status_code=404, detail=f"Anime not found on AniZone: {title}")
+
+        watch_url = f"{ANIZONE_BASE}/anime/{slug}/{episode_num}"
+        watch_res = await client.get(watch_url)
+        if watch_res.status_code != 200:
+            raise HTTPException(status_code=502, detail="Episode not found on AniZone")
+
+        html = watch_res.text
+
+        page_title = _anizone_page_title(html)
+        if page_title:
+            pt = page_title.lower()
+            ok = (title_eng and title_eng.lower() in pt) or (title_rom and title_rom.lower() in pt)
+            if not ok:
+                raise HTTPException(status_code=404, detail=f"Title mismatch: expected '{title}', got '{page_title}'")
+
+        m3u8_match = re.search(r'<media-player[^>]*\bsrc\s*=\s*"([^"]*)"', html)
+        if not m3u8_match:
+            raise HTTPException(status_code=404, detail="No stream found on AniZone")
+        stream_url = m3u8_match.group(1)
+
+        subtitles = []
+        for m in re.finditer(r'<track\s[^>]*src="?([^"\s>]+)"?\s[^>]*label="([^"]*)"', html):
+            subtitles.append({"file": m.group(1), "label": m.group(2)})
+
+        return {
+            "streams": [{"url": stream_url, "type": "hls", "quality": "1080p"}],
+            "subtitles": subtitles,
+            "_slug": slug,
+        }
+
+
+# === CORS Proxy for AniZone HLS streams ===
+# Rewrites m3u8 manifests to route all segment/key/sub-playlist requests
+# through this Vercel endpoint, adding CORS headers so hls.js can play them.
+
+def _rewrite_m3u8(content: str, base_url: str, proxy_base: str) -> str:
+    def _abs(uri: str) -> str:
+        if uri.startswith("http://") or uri.startswith("https://"):
+            return uri
+        return urljoin(base_url, uri)
+
+    # Replace URI="..." in EXT tags (playlists, keys, etc.)
+    content = re.sub(
+        r'(URI\s*=\s*)"([^"]*)"',
+        lambda m: f'{m.group(1)}"{proxy_base}?url={quote(_abs(m.group(2)), safe="")}"',
+        content,
+    )
+    # Replace standalone URIs (segment files, sub-playlists on their own line)
+    content = re.sub(
+        r'^([ \t]*)((?:\.\./|\./)?[a-zA-Z0-9_\-\.]+(?:/[a-zA-Z0-9_\-\.]+)*\.(?:m3u8|ts|key)[a-zA-Z0-9_\-\.]*)\s*$',
+        lambda m: m.group(1) + proxy_base + "?url=" + quote(_abs(m.group(2).strip()), safe=""),
+        content,
+        flags=re.MULTILINE,
+    )
+    return content
+
+
+@app.get("/az-proxy")
+async def az_proxy(url: str, request: Request):
+    fetch_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://anizone.to/",
+        "Origin": "https://anizone.to",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        try:
+            resp = await client.get(url, headers=fetch_headers)
+            content = await resp.aread()
+        except Exception as e:
+            return Response(content=str(e), status_code=502)
+
+    ctype = resp.headers.get("content-type", "")
+    if not ctype or "mpegurl" in ctype or url.endswith(".m3u8"):
+        try:
+            text = content.decode("utf-8")
+            parsed = urlparse(url)
+            path = parsed.path
+            base = f"{parsed.scheme}://{parsed.netloc}{path.rsplit('/', 1)[0]}/" if "/" in path else f"{parsed.scheme}://{parsed.netloc}/"
+            proxy_base = str(request.base_url).rstrip("/") + "/az-proxy"
+            text = _rewrite_m3u8(text, base, proxy_base)
+            content = text.encode("utf-8")
+        except Exception:
+            pass
+
+    return Response(
+        content=content,
+        status_code=resp.status_code,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS, HEAD",
+            "Content-Type": ctype or "application/octet-stream",
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
+
+
+@app.options("/az-proxy")
+async def az_proxy_options():
+    return Response(
+        content="",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
