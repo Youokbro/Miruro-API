@@ -1,5 +1,5 @@
 import base64, json, gzip, httpx, os, re
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1521,3 +1521,77 @@ async def get_gogoanime_sources(anilist_id: int, episode_num: int):
             raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Gogoanime scrape failed: {str(e)}")
+
+
+# ─── TMDB Proxy ─────────────────────────────────────────────────────────────
+# Proxies requests to TMDB so the frontend doesn't expose the API key.
+
+TMDB_KEY = os.getenv("TMDB_KEY", "0ff3dcace998b2fa393607f0af17a6a5")
+TMDB_BASE = "https://api.themoviedb.org/3"
+
+
+@app.get("/tmdb/{path:path}")
+async def tmdb_proxy(path: str, request: Request):
+    query_params = dict(request.query_params)
+    query_params["api_key"] = TMDB_KEY
+    url = f"{TMDB_BASE}/{path}?{urlencode(query_params)}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(url, headers={"User-Agent": "AnimeStream/1.0"})
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/json"),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"TMDB proxy failed: {str(e)}")
+
+
+# ─── OpenSubtitles Proxy ─────────────────────────────────────────────────────
+
+OS_KEY = os.getenv("OPENSUBTITLES_KEY", "KkRrsjYvWKEsREXgDETE8aBP4WktuXbH")
+OS_BASE = "https://api.opensubtitles.com/api/v1"
+
+
+@app.get("/subtitles/search")
+async def subtitles_search(
+    languages: str = "en",
+    tmdb_id: Optional[int] = Query(None),
+    parent_imdb_id: Optional[str] = Query(None),
+    season_number: Optional[int] = Query(None),
+    episode_number: Optional[int] = Query(None),
+    query: Optional[str] = Query(None),
+):
+    params = {"languages": languages, "order_by": "download_count", "order_direction": "desc"}
+    if tmdb_id:
+        params["tmdb_id"] = tmdb_id
+    if parent_imdb_id:
+        params["parent_imdb_id"] = parent_imdb_id
+    if season_number is not None:
+        params["season_number"] = season_number
+    if episode_number is not None:
+        params["episode_number"] = episode_number
+    if query:
+        params["query"] = query
+    url = f"{OS_BASE}/subtitles?{urlencode(params)}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(url, headers={"Api-Key": OS_KEY, "User-Agent": "AnimeStream/1.0"})
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"OpenSubtitles search failed: {str(e)}")
+
+
+@app.post("/subtitles/download")
+async def subtitles_download(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(
+                f"{OS_BASE}/download",
+                json=body,
+                headers={"Api-Key": OS_KEY, "User-Agent": "AnimeStream/1.0", "Content-Type": "application/json"},
+            )
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"OpenSubtitles download failed: {str(e)}")
