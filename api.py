@@ -1226,3 +1226,298 @@ async def az_proxy_options():
             "Access-Control-Allow-Headers": "*",
         },
     )
+
+
+# ─── hianime.to (aniwatch) Scraper ─────────────────────────────────────────────
+# Uses hianime.to's internal JSON API for search, episodes, and stream sources.
+
+HIANIME_BASE = "https://hianime.to"
+HIANIME_AJAX = "https://hianime.to/ajax"
+HIANIME_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://hianime.to/",
+}
+
+
+@app.get("/hianime/search/{anilist_id}")
+async def hianime_search(anilist_id: int):
+    gql = "query ($id: Int) { Media(id: $id, type: ANIME) { title { romaji english } } }"
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+
+    title_eng = (media.get("title") or {}).get("english", "") or ""
+    title_rom = (media.get("title") or {}).get("romaji", "") or ""
+    titles_to_try = [t for t in [title_eng, title_rom] if t]
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HIANIME_HEADERS) as client:
+        for search_title in titles_to_try:
+            try:
+                r = await client.get(f"{HIANIME_BASE}/api/anime/search?q={quote(search_title)}")
+                if r.status_code == 200:
+                    body = r.json()
+                    animes = body.get("animes") or body.get("results") or []
+                    for a in animes:
+                        aid = a.get("id")
+                        aname = (a.get("name") or "").lower()
+                        ajname = (a.get("jname") or "").lower()
+                        search_lower = search_title.lower()
+                        if search_lower in aname or search_lower in ajname:
+                            return {"slug": aid, "title_used": search_title}
+                # Try HTML search fallback
+                hr = await client.get(f"{HIANIME_BASE}/search?keyword={quote(search_title)}")
+                if hr.status_code == 200:
+                    import re as _re
+                    slugs = _re.findall(r'/watch/([^"\']+)', hr.text)
+                    seen = set()
+                    for sl in slugs:
+                        if sl not in seen:
+                            seen.add(sl)
+                            return {"slug": sl, "title_used": search_title}
+            except Exception:
+                continue
+
+    raise HTTPException(status_code=404, detail="Anime not found on hianime.to")
+
+
+@app.get("/hianime/{anilist_id}/{episode_num}")
+async def get_hianime_sources(anilist_id: int, episode_num: int):
+    # Step 1: search for the anime
+    search_resp = await hianime_search(anilist_id)
+    slug = search_resp.get("slug")
+    if not slug:
+        raise HTTPException(status_code=404, detail="Anime not found")
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HIANIME_HEADERS) as client:
+        # Step 2: get episode list
+        try:
+            r = await client.get(f"{HIANIME_BASE}/api/anime/{slug}/episodes")
+            if r.status_code == 200:
+                body = r.json()
+                raw_eps = body.get("episodes") or body.get("results") or []
+            else:
+                raw_eps = []
+        except Exception:
+            try:
+                r = await client.get(f"{HIANIME_AJAX}/v2/episode/list/{slug.split('-')[-1]}")
+                if r.status_code == 200:
+                    raw_eps = r.json().get("episodes") or []
+                else:
+                    raw_eps = []
+            except Exception:
+                raw_eps = []
+
+        # Try to fetch episode page and extract episode ID from HTML
+        ep_href = None
+        # Check if api returned structured episodes
+        for ep in raw_eps:
+            ep_no = ep.get("number") or ep.get("episodeNo") or ep.get("episode")
+            if ep_no and int(ep_no) == episode_num:
+                ep_href = ep.get("episodeId") or ep.get("id") or ep.get("href")
+                break
+
+        if not ep_href:
+            # Fallback: scrape episode page HTML for the episode-srcs ID
+            try:
+                page_resp = await client.get(f"{HIANIME_BASE}/watch/{slug}?ep={episode_num}")
+                if page_resp.status_code == 200:
+                    import re as _re2
+                    # Look for data-id or episode ID in the page
+                    mid = _re2.search(r'data-id=["\']([^"\']+)', page_resp.text)
+                    if mid:
+                        ep_href = mid.group(1)
+                    if not ep_href:
+                        # Try lastEpisode or similar data attributes
+                        mid2 = _re2.search(r'data-episode-id=["\']([^"\']+)', page_resp.text)
+                        if mid2:
+                            ep_href = mid2.group(1)
+                    if not ep_href:
+                        ep_href = f"{slug}?ep={episode_num}"
+            except Exception:
+                ep_href = f"{slug}?ep={episode_num}"
+
+        if not ep_href:
+            raise HTTPException(status_code=404, detail="Episode not found on hianime.to")
+
+        episode_id = ep_href if "?ep=" in ep_href or "&ep=" in ep_href else f"{ep_href}?ep={episode_num}"
+
+        # Step 3: get stream sources
+        streams = []
+        subtitles = []
+        servers_to_try = ["hd-1", "hd-2", "server-1", "server-2"]
+
+        for server in servers_to_try:
+            try:
+                src_url = f"{HIANIME_BASE}/api/anime/episode-srcs?id={quote(episode_id)}&server={server}&category=sub"
+                sr = await client.get(src_url)
+                if sr.status_code == 200:
+                    data = sr.json()
+                    raw_sources = data.get("sources") or data.get("streams") or []
+                    for src in raw_sources:
+                        url = src.get("url", "")
+                        if url and (url.endswith(".m3u8") or src.get("isM3U8")):
+                            streams.append({
+                                "url": url,
+                                "type": "hls",
+                                "quality": src.get("quality") or src.get("label") or "HD",
+                            })
+                    raw_subs = data.get("subtitles") or data.get("tracks") or []
+                    for sub in raw_subs:
+                        sub_url = sub.get("url") or sub.get("file", "")
+                        sub_label = sub.get("lang") or sub.get("label", "English")
+                        if sub_url:
+                            subtitles.append({"file": sub_url, "label": sub_label})
+                    if streams:
+                        break
+            except Exception:
+                continue
+
+        if not streams:
+            raise HTTPException(status_code=404, detail="No streams found on hianime.to")
+
+        return {"streams": streams, "subtitles": subtitles, "_slug": slug, "_server": server}
+
+
+# ─── Gogoanime Scraper ─────────────────────────────────────────────────────────
+
+GOGO_BASE = "https://gogoanime3.co"
+GOGO_AJAX = "https://ajax.gogo-cdn.com/ajax"
+GOGO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://gogoanime3.co/",
+}
+
+
+def _gogo_search_slug(html: str):
+    import re as _re3
+    # Find first anime result link from search page
+    for m in _re3.finditer(r'<a[^>]*href="(/(category|anime)/[^"]+)"', html):
+        return m.group(1).split("/")[-1]
+    return None
+
+
+def _gogo_episode_id(html: str):
+    """Extract the video ID / streaming server ID from an episode page."""
+    import re as _re4
+    # Try data-video-id attribute
+    m = _re4.search(r'data-video-id\s*=\s*["\']([^"\']+)', html)
+    if m:
+        return m.group(1)
+    # Try server URL pattern
+    m = _re4.search(r'src\s*=\s*["\'](?:https?://[^/]+/)?streaming\.php\?id=([^"\']+)', html)
+    if m:
+        return m.group(1)
+    # Try embed URL
+    m = _re4.search(r'(?:https?://[^/]+/)?embed(?:stream)?/[^"\']*id=([^"\'&]+)', html)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def _gogo_get_streams(client, video_id: str):
+    """Try to get m3u8 URL from gogoanime's encrypt-ajax API."""
+    if not video_id:
+        return []
+    streams = []
+    try:
+        enc_url = f"{GOGO_BASE}/encrypt-ajax.php?id={video_id}"
+        resp = await client.get(enc_url, headers={**GOGO_HEADERS, "X-Requested-With": "XMLHttpRequest"})
+        if resp.status_code == 200:
+            data = resp.json()
+            raw = data.get("data") or data.get("source") or []
+            if isinstance(raw, str):
+                import base64 as _b64
+                try:
+                    raw = json.loads(_b64.b64decode(raw).decode())
+                except Exception:
+                    raw = []
+            for item in raw:
+                url = item.get("file", "")
+                label = item.get("label", "") or item.get("quality", "")
+                if url:
+                    streams.append({"url": url, "type": "hls" if ".m3u8" in url else "mp4", "quality": label or "HD"})
+        return streams
+    except Exception:
+        return streams
+
+
+async def _gogo_get_streams_from_page(client, page_url: str):
+    """Extract stream URL from an episode page via iframe/embed."""
+    try:
+        resp = await client.get(page_url)
+        if resp.status_code != 200:
+            return []
+        import re as _re5
+        # Look for direct m3u8 URLs in the page
+        m3u8s = _re5.findall(r'(https?://[^"\']+\.m3u8[^"\']*)', resp.text)
+        if m3u8s:
+            return [{"url": m3u8s[0], "type": "hls", "quality": "HD"}]
+        # Look for iframe with stream
+        iframes = _re5.findall(r'<iframe[^>]*src="([^"]+)"', resp.text)
+        if iframes:
+            iframe_url = iframes[0]
+            if not iframe_url.startswith("http"):
+                iframe_url = GOGO_BASE + iframe_url
+            ir = await client.get(iframe_url)
+            if ir.status_code == 200:
+                m3u8s2 = _re5.findall(r'(https?://[^"\']+\.m3u8[^"\']*)', ir.text)
+                if m3u8s2:
+                    return [{"url": m3u8s2[0], "type": "hls", "quality": "HD"}]
+        return []
+    except Exception:
+        return []
+
+
+@app.get("/gogoanime/{anilist_id}/{episode_num}")
+async def get_gogoanime_sources(anilist_id: int, episode_num: int):
+    gql = "query ($id: Int) { Media(id: $id, type: ANIME) { title { romaji english } } }"
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+
+    title_eng = (media.get("title") or {}).get("english", "") or ""
+    title_rom = (media.get("title") or {}).get("romaji", "") or ""
+    titles_to_try = list(dict.fromkeys([t for t in [title_eng, title_rom] if t]))
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=GOGO_HEADERS) as client:
+        # Step 1: search for slug
+        slug = None
+        for search_title in titles_to_try:
+            try:
+                sr = await client.get(f"{GOGO_BASE}/search.html?keyword={quote(search_title)}")
+                if sr.status_code == 200:
+                    slug = _gogo_search_slug(sr.text)
+                    if slug:
+                        break
+            except Exception:
+                continue
+
+        if not slug:
+            raise HTTPException(status_code=404, detail=f"Anime not found on Gogoanime: {title_eng or title_rom}")
+
+        # Step 2: get stream for episode
+        ep_page_url = f"{GOGO_BASE}/{slug}-episode-{episode_num}"
+
+        try:
+            ep_resp = await client.get(ep_page_url)
+            if ep_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="Episode page not found on Gogoanime")
+
+            # Try encrypt-ajax approach first
+            video_id = _gogo_episode_id(ep_resp.text)
+            streams = await _gogo_get_streams(client, video_id)
+
+            # Fallback: try to extract from page/iframe directly
+            if not streams:
+                streams = await _gogo_get_streams_from_page(client, ep_page_url)
+
+            if not streams:
+                raise HTTPException(status_code=404, detail="No stream found on Gogoanime")
+
+            return {"streams": streams, "subtitles": [], "_slug": slug}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Gogoanime scrape failed: {str(e)}")
